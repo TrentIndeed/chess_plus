@@ -180,6 +180,40 @@ Each milestone is shippable and demoable on its own.
 
 ---
 
+## 7a. UI / Design Spec — chess.com parity
+
+**Design goal: instantly familiar to a chess.com user.** We replicate the layout, color language, and interaction patterns; we do NOT copy their asset files (logo, name, "Neo" piece art, bot avatars, sound files, coach characters are copyrighted/trademarked — layout and color schemes are not). Own-made or open-licensed lookalike assets in the same style.
+
+### Frame & theme
+- Dark charcoal app background (~`#312e2b`), dark left **sidebar nav** (logo top; Play, Puzzles, Learn, Review, Settings), content area with board center-left and a context-sensitive **right panel**.
+- Primary action green (~`#81b64c`) for Play/New Game buttons; muted gray secondary buttons; same rounded-card visual language.
+
+### Board
+- Default green theme: light squares ~`#ebecd0`, dark ~`#739552`; yellow last-move highlight, legal-move dots, red check flash, coordinate labels on the board edge.
+- Open-licensed 2D piece set closest in feel to chess.com's default; board & piece themes user-selectable later.
+- Standard sounds (move, capture, check, game end) — sourced free-licensed or self-recorded.
+
+### Game screen
+- Player bars above/below board: avatar, name, rating badge, captured pieces + material diff, clock on the right.
+- Right panel: two-column move list, game controls (resign, draw, rematch, new bot), and our additions as tabs in the same panel: **Coach**, **Opening**, **Endgame Guide** — parity layout, extra tabs.
+- Move-quality badges in chess.com's iconography style: brilliant (teal !!), great, best (green star), excellent, good, book, inaccuracy (yellow ?!), mistake (orange ?), blunder (red ??), missed win — shown on the destination square and beside moves in the list (post-move/review contexts only, per §4a).
+
+### Bot picker
+- Card grid of bot personas grouped by tier (Beginner → Master), each with avatar, name, Elo badge; challenge panel on the right (color choice, coach on/off, time control later). Our own characters, same layout.
+
+### Review & puzzles
+- Review: eval bar + eval graph + per-side accuracy + coach speech-bubble commentary — same structure, our teaching engine behind it.
+- Puzzles/drills: centered board, prompt banner ("White to move — find the mate"), streak and rating counters.
+
+### Differences (intentional)
+- No matchmaking, social, chat, news, or premium/upsell surfaces.
+- Coach panel is more prominent (teaching is the product).
+- Our own branding: name, logo, bot characters, coach character.
+
+Parity details (exact paddings, fonts) get refined by visual comparison against the live site during M0–M3; "you'd have to look twice" is the bar, pixel-perfect is polish.
+
+---
+
 ## 8. Risks & Mitigations
 
 | Risk | Mitigation |
@@ -192,6 +226,7 @@ Each milestone is shippable and demoable on its own.
 | Opening annotations are hand-written (slow, needs chess knowledge) | Start with the London only (small, systemic, beginner-favorite), template the annotation format, add one opening at a time |
 | Coach drifts into move-feeding as features grow | §4a rules are acceptance criteria for every teaching feature; hint-usage tracking keeps it visible |
 | Scope creep toward chess.com parity | Non-goals list above; bots + coach + puzzles + opening/endgame guides only until M6 is done |
+| Copying chess.com too literally (assets/branding) | §7a rule: replicate layout/colors/patterns only; all art, names, sounds, and characters are original or open-licensed |
 
 ---
 
