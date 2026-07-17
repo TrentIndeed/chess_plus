@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { Chess } from 'chess.js';
-import { OPENING_BOOK, recognizeOpening } from '../src/core/openings/book';
+import {
+  OPENING_BOOK,
+  POPULAR_OPENINGS,
+  getOpeningLine,
+  lessonStep,
+  recognizeOpening,
+} from '../src/core/openings/book';
 
 describe('opening book', () => {
   it('every book line is legal', () => {
@@ -38,5 +44,33 @@ describe('opening book', () => {
   it('returns null for unknown starts', () => {
     expect(recognizeOpening(['h4']).name).toBeNull();
     expect(recognizeOpening([]).candidates).toHaveLength(0);
+  });
+});
+
+describe('opening lessons', () => {
+  it('every popular study opening exists in the book', () => {
+    for (const name of POPULAR_OPENINGS) {
+      expect(getOpeningLine(name), name).not.toBeNull();
+    }
+  });
+
+  it('walks the London line move by move', () => {
+    const line = getOpeningLine('London System')!;
+    let step = lessonStep(line, []);
+    expect(step).toMatchObject({ status: 'in-line', nextSan: 'd4', nextColor: 'w' });
+    step = lessonStep(line, ['d4', 'd5']);
+    expect(step).toMatchObject({ status: 'in-line', nextSan: 'Bf4', nextColor: 'w' });
+  });
+
+  it('reports who deviated and what book was', () => {
+    const line = getOpeningLine('London System')!;
+    const step = lessonStep(line, ['d4', 'd5', 'Nc3']);
+    expect(step).toMatchObject({ status: 'deviated', expectedSan: 'Bf4', deviatedBy: 'w', atPly: 2 });
+  });
+
+  it('reports completion at the end of the line', () => {
+    const line = getOpeningLine('Italian Game')!;
+    expect(lessonStep(line, [...line.san]).status).toBe('complete');
+    expect(lessonStep(line, [...line.san, 'h3', 'h6']).status).toBe('complete');
   });
 });

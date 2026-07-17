@@ -76,6 +76,46 @@ export const OPENING_BOOK: OpeningLine[] = [
   },
 ];
 
+/** The three most-played openings — offered as study choices in the picker. */
+export const POPULAR_OPENINGS = ['London System', 'Italian Game', 'Sicilian Defense'] as const;
+export type PopularOpening = (typeof POPULAR_OPENINGS)[number];
+
+export function getOpeningLine(name: string): OpeningLine | null {
+  return OPENING_BOOK.find((l) => l.name === name) ?? null;
+}
+
+export type LessonStep =
+  | { status: 'in-line'; nextSan: string; nextIdea: string | null; nextColor: 'w' | 'b'; ply: number }
+  | { status: 'deviated'; expectedSan: string; idea: string | null; deviatedBy: 'w' | 'b'; atPly: number }
+  | { status: 'complete' };
+
+/**
+ * Where the game stands relative to a *chosen* study line. Unlike
+ * recognizeOpening (which passively identifies), this drives active teaching:
+ * the player opted in, so the coach may show the next book move.
+ */
+export function lessonStep(line: OpeningLine, sanHistory: string[]): LessonStep {
+  let i = 0;
+  while (i < sanHistory.length && i < line.san.length && sanHistory[i] === line.san[i]) i++;
+  if (i < sanHistory.length && i < line.san.length) {
+    return {
+      status: 'deviated',
+      expectedSan: line.san[i],
+      idea: line.ideas[i] ?? null,
+      deviatedBy: i % 2 === 0 ? 'w' : 'b',
+      atPly: i,
+    };
+  }
+  if (sanHistory.length >= line.san.length) return { status: 'complete' };
+  return {
+    status: 'in-line',
+    nextSan: line.san[sanHistory.length],
+    nextIdea: line.ideas[sanHistory.length] ?? null,
+    nextColor: sanHistory.length % 2 === 0 ? 'w' : 'b',
+    ply: sanHistory.length,
+  };
+}
+
 export interface OpeningStatus {
   /** Named only once the game uniquely identifies one book line. */
   name: string | null;

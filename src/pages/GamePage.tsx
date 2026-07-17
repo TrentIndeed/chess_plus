@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Chess, Move } from 'chess.js';
-import { BoardView, Arrow } from '../components/BoardView';
+import { BoardView } from '../components/BoardView';
 import { PlayerBar } from '../components/PlayerBar';
 import { MoveList, MoveRow } from '../components/MoveList';
 import { VerdictBadge, VERDICT_STYLE } from '../components/verdictBadge';
@@ -8,27 +8,39 @@ import { Engine } from '../engine/uci';
 import { PERSONAS, Persona } from '../core/bot/personas';
 import { Candidate, chooseMove, mateToCp } from '../core/bot/humanizer';
 import { Plan, pickPlan } from '../core/bot/plans';
-import { judgeMove, Judgment } from '../core/coach/classify';
+import { judgeMove, Verdict } from '../core/coach/classify';
 import { explainMove } from '../core/coach/explain';
-import { recognizeOpening, OpeningStatus } from '../core/openings/book';
+import {
+  recognizeOpening,
+  getOpeningLine,
+  lessonStep,
+  POPULAR_OPENINGS,
+  PopularOpening,
+} from '../core/openings/book';
 import { detectEndgame, EndgameState } from '../core/endgame/guide';
 
 type Phase = 'picker' | 'loading' | 'playing' | 'over';
-type Tab = 'moves' | 'coach' | 'opening' | 'endgame';
+type TimeControl = 'blitz' | 'normal' | 'unlimited';
 
-interface CoachReport {
-  ply: number;
-  san: string;
-  judgment: Judgment;
-  notes: string[];
-  betterMove: string | null;
-  showBetter: boolean;
+const TIME_MS: Record<Exclude<TimeControl, 'unlimited'>, number> = {
+  blitz: 5 * 60_000,
+  normal: 10 * 60_000,
+};
+
+interface ChatMsg {
+  id: number;
+  san?: string;
+  verdict?: Verdict;
+  text: string;
+  /** Retrospective better move — revealed only on click (never for the current position). */
+  better?: string | null;
+  revealed?: boolean;
 }
 
 interface GameStats {
   accuracies: number[];
   counts: Record<string, number>;
-  moveHintsUsed: number;
+  hintsUsed: number;
 }
 
 const PIECE_NAME: Record<string, string> = {
@@ -40,33 +52,62 @@ const PIECE_NAME: Record<string, string> = {
   k: 'king',
 };
 
+const OPENING_PICK_INFO: Record<PopularOpening, { color: 'w' | 'b'; tag: string }> = {
+  'London System': { color: 'w', tag: 'as White · solid system' },
+  'Italian Game': { color: 'w', tag: 'as White · classical play' },
+  'Sicilian Defense': { color: 'b', tag: 'as Black · fights 1.e4' },
+};
+
 export function GamePage() {
   const gameRef = useRef(new Chess());
   const botEngine = useRef<Engine | null>(null);
   const coachEngine = useRef<Engine | null>(null);
   const planRef = useRef<Plan | null>(null);
   const sessionRef = useRef(0);
+  const clocksRef = useRef<{ w: number; b: number }>({ w: 0, b: 0 });
+  const lastTickRef = useRef(0);
+  const chatIdRef = useRef(0);
+  const chatBoxRef = useRef<HTMLDivElement | null>(null);
+  const endgameRef = useRef<EndgameState | null>(null);
+  // Dedupe refs so chat commentary fires once per event, not per render.
+  const openingNameRef = useRef<string | null>(null);
+  const openingDevPlyRef = useRef(-1);
+  const lessonPromptPlyRef = useRef(-1);
+  const lessonDevPlyRef = useRef(-1);
+  const lessonCompleteRef = useRef(false);
+  const endgameTypeRef = useRef<string | null>(null);
+  const endgameNarrationRef = useRef('');
+  const stalemateWarnFenRef = useRef('');
+  const fiftyWarnedRef = useRef(false);
+  const hintRef = useRef<{ ply: number; level: number }>({ ply: -1, level: 0 });
 
   const [phase, setPhase] = useState<Phase>('picker');
   const [persona, setPersona] = useState<Persona>(PERSONAS[1]);
   const [playerColor, setPlayerColor] = useState<'w' | 'b'>('w');
   const [colorChoice, setColorChoice] = useState<'w' | 'b' | 'random'>('w');
   const [coachOn, setCoachOn] = useState(true);
+  const [timeControl, setTimeControl] = useState<TimeControl>('normal');
+  const [learnOpening, setLearnOpening] = useState<PopularOpening | null>(null);
   const [fen, setFen] = useState(gameRef.current.fen());
   const [rows, setRows] = useState<MoveRow[]>([]);
   const [lastMove, setLastMove] = useState<{ from: string; to: string } | null>(null);
   const [thinking, setThinking] = useState(false);
-  const [tab, setTab] = useState<Tab>('moves');
-  const [report, setReport] = useState<CoachReport | null>(null);
-  const [coachBusy, setCoachBusy] = useState(false);
-  const [opening, setOpening] = useState<OpeningStatus | null>(null);
-  const [endgame, setEndgame] = useState<EndgameState | null>(null);
+  const [chat, setChat] = useState<ChatMsg[]>([]);
+  const [clocks, setClocks] = useState<{ w: number; b: number }>({ w: 0, b: 0 });
   const [result, setResult] = useState<string | null>(null);
-  const [stats, setStats] = useState<GameStats>({ accuracies: [], counts: {}, moveHintsUsed: 0 });
-  const [hint, setHint] = useState<{ level: number; text: string; arrow: Arrow | null } | null>(null);
+  const [stats, setStats] = useState<GameStats>({ accuracies: [], counts: {}, hintsUsed: 0 });
   const [engineError, setEngineError] = useState<string | null>(null);
 
   const history = gameRef.current.history({ verbose: true }) as Move[];
+
+  const pushChat = useCallback((msg: Omit<ChatMsg, 'id'>) => {
+    setChat((c) => [...c, { ...msg, id: chatIdRef.current++ }]);
+  }, []);
+
+  useEffect(() => {
+    const el = chatBoxRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [chat]);
 
   const finishIfOver = useCallback((): boolean => {
     const g = gameRef.current;
@@ -83,18 +124,131 @@ export function GamePage() {
     return true;
   }, [playerColor, persona]);
 
-  const refreshSidecars = useCallback(() => {
-    const g = gameRef.current;
-    setOpening(recognizeOpening(g.history()));
-    setEndgame(detectEndgame(g));
-  }, []);
+  /** Chat commentary that runs after ANY move: openings, lesson, endgame. */
+  const afterAnyMove = useCallback(
+    (movedByPlayer: boolean) => {
+      const g = gameRef.current;
+      const sans = g.history();
+
+      if (learnOpening) {
+        const line = getOpeningLine(learnOpening);
+        if (line) {
+          const step = lessonStep(line, sans);
+          if (step.status === 'deviated' && lessonDevPlyRef.current !== step.atPly) {
+            lessonDevPlyRef.current = step.atPly;
+            if (step.deviatedBy === playerColor) {
+              pushChat({
+                text: `📖 In the ${learnOpening}, the book move was ${step.expectedSan}${step.idea ? ` — ${step.idea}` : '.'} We've left the study line, so play on general principles now.`,
+              });
+            } else {
+              pushChat({
+                text: `📖 ${persona.name} left the ${learnOpening} main line (book was ${step.expectedSan}). That's normal — keep developing and watch what their move changed.`,
+              });
+            }
+          } else if (step.status === 'complete' && !lessonCompleteRef.current) {
+            lessonCompleteRef.current = true;
+            pushChat({ text: `🎓 That's the full ${learnOpening} main line — well studied! From here it's a real game.` });
+          } else if (
+            step.status === 'in-line' &&
+            step.nextColor === playerColor &&
+            lessonPromptPlyRef.current !== step.ply
+          ) {
+            lessonPromptPlyRef.current = step.ply;
+            pushChat({
+              text: `📖 ${learnOpening} — the book move here is ${step.nextSan}${step.nextIdea ? `: ${step.nextIdea}` : '.'}`,
+            });
+          }
+        }
+      } else {
+        // Passive recognition when nothing is being studied.
+        const status = recognizeOpening(sans);
+        if (status.name && openingNameRef.current !== status.name) {
+          openingNameRef.current = status.name;
+          pushChat({
+            text: `📖 This is the ${status.name}.${status.lastIdea ? ` ${status.lastIdea}` : ''}`,
+          });
+        }
+        if (
+          movedByPlayer &&
+          status.deviation &&
+          status.deviation.atPly === sans.length - 1 &&
+          openingDevPlyRef.current !== status.deviation.atPly
+        ) {
+          openingDevPlyRef.current = status.deviation.atPly;
+          pushChat({
+            text: `📖 Theory here was ${status.deviation.expectedSan}${status.deviation.idea ? ` — ${status.deviation.idea}` : '.'} Your move is playable, just no longer book.`,
+          });
+        }
+      }
+
+      const eg = detectEndgame(g);
+      endgameRef.current = eg;
+      if (eg) {
+        if (eg.type !== endgameTypeRef.current) {
+          endgameTypeRef.current = eg.type;
+          endgameNarrationRef.current = eg.narration;
+          const mine = eg.strongSide === playerColor;
+          pushChat({
+            text: mine
+              ? `🏁 ${eg.title}. ${eg.technique[0]} ${eg.narration}`
+              : `🏁 Basic mate territory — defend as long as you can and watch for stalemate chances.`,
+          });
+        } else if (eg.strongSide === playerColor && eg.narration !== endgameNarrationRef.current) {
+          endgameNarrationRef.current = eg.narration;
+          pushChat({ text: `📍 ${eg.narration}` });
+        }
+        if (
+          eg.strongSide === playerColor &&
+          eg.stalemateWarning &&
+          stalemateWarnFenRef.current !== g.fen()
+        ) {
+          stalemateWarnFenRef.current = g.fen();
+          pushChat({
+            text: '⚠️ Careful — the defending king is nearly out of squares. Before your next move, make sure it still has one (or that you give check). Stalemate throws the win away.',
+          });
+        }
+        if (eg.strongSide === playerColor && eg.fiftyMoveClock >= 70 && !fiftyWarnedRef.current) {
+          fiftyWarnedRef.current = true;
+          pushChat({
+            text: `⏳ The 50-move rule is approaching (${100 - eg.fiftyMoveClock} half-moves left). Make progress: shrink the box, bring your king up.`,
+          });
+        }
+      } else {
+        endgameTypeRef.current = null;
+      }
+    },
+    [learnOpening, playerColor, persona, pushChat],
+  );
 
   const botMove = useCallback(async () => {
     const g = gameRef.current;
     const session = sessionRef.current;
     if (g.isGameOver() || !botEngine.current) return;
     setThinking(true);
+
+    const applyBotMove = (san: string) => {
+      const mv = g.move(san);
+      setFen(g.fen());
+      setLastMove({ from: mv.from, to: mv.to });
+      setRows((r) => [...r, { san: mv.san, verdict: null }]);
+      afterAnyMove(false);
+      finishIfOver();
+    };
+
     try {
+      // When studying an opening, the bot cooperates: it plays its side of
+      // the chosen line (usually), so the student gets real practice.
+      if (learnOpening) {
+        const line = getOpeningLine(learnOpening);
+        const step = line ? lessonStep(line, g.history()) : null;
+        if (step && step.status === 'in-line' && step.nextColor === g.turn() && Math.random() < 0.9) {
+          await new Promise((r) => setTimeout(r, 500 + Math.random() * 700));
+          if (session !== sessionRef.current) return;
+          applyBotMove(step.nextSan);
+          return;
+        }
+      }
+
       const analysis = await botEngine.current.analyze(g.fen(), persona.depth, persona.multipv);
       if (session !== sessionRef.current) return;
       const cands: Candidate[] = analysis.lines
@@ -108,38 +262,37 @@ export function GamePage() {
         planRef.current = pickPlan(g, planRef.current);
       }
       const choice = chooseMove(cands, persona, g, planRef.current, Math.random);
-      await new Promise((r) => setTimeout(r, choice.thinkMs));
+
+      // Pace realistically, but never burn the clock in timed games.
+      let cap = timeControl === 'blitz' ? 1800 : 4000;
+      if (timeControl !== 'unlimited') {
+        const left = clocksRef.current[g.turn()];
+        if (left < 60_000) cap = Math.min(cap, 700);
+        if (left < 15_000) cap = Math.min(cap, 200);
+      }
+      await new Promise((r) => setTimeout(r, Math.min(choice.thinkMs, cap)));
       if (session !== sessionRef.current) return;
+      const uci = choice.move;
       const mv = g.move({
-        from: choice.move.slice(0, 2),
-        to: choice.move.slice(2, 4),
-        promotion: choice.move.length > 4 ? choice.move[4] : undefined,
+        from: uci.slice(0, 2),
+        to: uci.slice(2, 4),
+        promotion: uci.length > 4 ? uci[4] : undefined,
       });
-      setFen(g.fen());
-      setLastMove({ from: mv.from, to: mv.to });
-      setRows((r) => [...r, { san: mv.san, verdict: null }]);
-      refreshSidecars();
-      finishIfOver();
+      g.undo();
+      applyBotMove(mv.san);
     } catch (e) {
       console.error('bot move failed', e);
-      // Engine hiccup: play any legal move rather than freezing the game.
-      const fallback = g.moves({ verbose: true })[0];
-      if (fallback && session === sessionRef.current) {
-        g.move(fallback);
-        setFen(g.fen());
-        setRows((r) => [...r, { san: fallback.san, verdict: null }]);
-        finishIfOver();
-      }
+      const fallback = g.moves();
+      if (fallback.length > 0 && session === sessionRef.current) applyBotMove(fallback[0]);
     } finally {
       if (session === sessionRef.current) setThinking(false);
     }
-  }, [persona, finishIfOver, refreshSidecars]);
+  }, [persona, learnOpening, timeControl, afterAnyMove, finishIfOver]);
 
   const analyzePlayerMove = useCallback(
     async (beforeFen: string, sansBefore: string[], played: Move, ply: number) => {
       if (!coachEngine.current) return;
       const session = sessionRef.current;
-      setCoachBusy(true);
       try {
         const playedUci = played.from + played.to + (played.promotion ?? '');
         const analysis = await coachEngine.current.analyze(beforeFen, 11, 3);
@@ -158,7 +311,6 @@ export function GamePage() {
           playedMate = inLines.mate ?? null;
           refutationUci = inLines.pv[1] ?? null;
         } else {
-          // Evaluate the position after the move (opponent to move) and negate.
           const afterGame = new Chess(beforeFen);
           afterGame.move({ from: played.from, to: played.to, promotion: played.promotion });
           if (afterGame.isGameOver()) {
@@ -183,7 +335,6 @@ export function GamePage() {
           isBookMove: recognizeOpening(sans).inBook,
         });
 
-        // Rebuild the pre-move game WITH history for pattern detectors.
         const before = new Chess();
         for (const san of sansBefore) before.move(san);
         const explanation = explainMove({
@@ -195,14 +346,6 @@ export function GamePage() {
           mateIn: bestMate != null && bestMate > 0 ? Math.ceil(bestMate / 2) : null,
         });
 
-        setReport({
-          ply,
-          san: played.san,
-          judgment,
-          notes: explanation.notes,
-          betterMove: explanation.betterMove,
-          showBetter: false,
-        });
         setRows((rows) =>
           rows.map((row, i) => (i === ply ? { ...row, verdict: judgment.verdict } : row)),
         );
@@ -211,14 +354,25 @@ export function GamePage() {
           accuracies: [...s.accuracies, judgment.accuracy],
           counts: { ...s.counts, [judgment.verdict]: (s.counts[judgment.verdict] ?? 0) + 1 },
         }));
-        if (['mistake', 'blunder', 'missed-mate'].includes(judgment.verdict)) setTab('coach');
+        // Quiet coach: good moves just get their badge; notes appear when
+        // there's something to learn.
+        const teachable = ['inaccuracy', 'mistake', 'blunder', 'missed-mate'].includes(
+          judgment.verdict,
+        );
+        if (teachable && explanation.notes.length > 0) {
+          pushChat({
+            san: played.san,
+            verdict: judgment.verdict,
+            text: explanation.notes.join('\n'),
+            better: explanation.betterMove,
+            revealed: false,
+          });
+        }
       } catch (e) {
         console.error('coach analysis failed', e);
-      } finally {
-        if (session === sessionRef.current) setCoachBusy(false);
       }
     },
-    [],
+    [pushChat],
   );
 
   const onDrop = useCallback(
@@ -237,14 +391,38 @@ export function GamePage() {
       setFen(g.fen());
       setLastMove({ from: mv.from, to: mv.to });
       setRows((r) => [...r, { san: mv.san, verdict: null }]);
-      setHint(null);
-      refreshSidecars();
+      afterAnyMove(true);
       if (coachOn) void analyzePlayerMove(beforeFen, sansBefore, mv, ply);
       if (!finishIfOver()) void botMove();
       return true;
     },
-    [phase, playerColor, thinking, coachOn, analyzePlayerMove, botMove, finishIfOver, refreshSidecars],
+    [phase, playerColor, thinking, coachOn, analyzePlayerMove, botMove, finishIfOver, afterAnyMove],
   );
+
+  // Clock: real elapsed time is charged to whoever's turn it is.
+  useEffect(() => {
+    if (phase !== 'playing' || timeControl === 'unlimited') return;
+    lastTickRef.current = Date.now();
+    const iv = setInterval(() => {
+      const now = Date.now();
+      const delta = now - lastTickRef.current;
+      lastTickRef.current = now;
+      const turn = gameRef.current.turn();
+      clocksRef.current[turn] = Math.max(0, clocksRef.current[turn] - delta);
+      setClocks({ ...clocksRef.current });
+      if (clocksRef.current[turn] === 0) {
+        sessionRef.current++;
+        setThinking(false);
+        setResult(
+          turn === playerColor
+            ? `You ran out of time — ${persona.name} wins`
+            : `${persona.name} ran out of time — you win!`,
+        );
+        setPhase('over');
+      }
+    }, 200);
+    return () => clearInterval(iv);
+  }, [phase, timeControl, playerColor, persona]);
 
   const startGame = useCallback(async () => {
     setPhase('loading');
@@ -260,35 +438,72 @@ export function GamePage() {
     sessionRef.current++;
     gameRef.current = new Chess();
     planRef.current = null;
+    endgameRef.current = null;
+    openingNameRef.current = null;
+    openingDevPlyRef.current = -1;
+    lessonPromptPlyRef.current = -1;
+    lessonDevPlyRef.current = -1;
+    lessonCompleteRef.current = false;
+    endgameTypeRef.current = null;
+    endgameNarrationRef.current = '';
+    stalemateWarnFenRef.current = '';
+    fiftyWarnedRef.current = false;
+    hintRef.current = { ply: -1, level: 0 };
+    chatIdRef.current = 0;
     const color = colorChoice === 'random' ? (Math.random() < 0.5 ? 'w' : 'b') : colorChoice;
     setPlayerColor(color);
     setFen(gameRef.current.fen());
     setRows([]);
-    setReport(null);
+    setChat([]);
     setLastMove(null);
-    setHint(null);
     setResult(null);
-    setStats({ accuracies: [], counts: {}, moveHintsUsed: 0 });
-    setOpening(null);
-    setEndgame(null);
-    setTab('moves');
+    setStats({ accuracies: [], counts: {}, hintsUsed: 0 });
+    const base = timeControl === 'unlimited' ? 0 : TIME_MS[timeControl];
+    clocksRef.current = { w: base, b: base };
+    setClocks({ w: base, b: base });
     setPhase('playing');
+    setChat([
+      {
+        id: chatIdRef.current++,
+        text: `👋 You're playing ${persona.name} (${persona.elo})${
+          timeControl !== 'unlimited' ? `, ${timeControl === 'blitz' ? '5 min blitz' : '10 min'}` : ''
+        }.${learnOpening ? ` We're studying the ${learnOpening} — I'll walk you through the line.` : ''}${
+          coachOn ? ' I’ll comment after your moves — never before.' : ''
+        } Good luck!`,
+      },
+    ]);
     if (color === 'b') void botMove();
-  }, [colorChoice, botMove]);
+    else if (learnOpening) {
+      // First lesson prompt for White before any move is made.
+      const line = getOpeningLine(learnOpening);
+      const step = line ? lessonStep(line, []) : null;
+      if (step && step.status === 'in-line' && step.nextColor === color) {
+        lessonPromptPlyRef.current = step.ply;
+        setChat((c) => [
+          ...c,
+          {
+            id: chatIdRef.current++,
+            text: `📖 ${learnOpening} — the book move here is ${step.nextSan}${step.nextIdea ? `: ${step.nextIdea}` : '.'}`,
+          },
+        ]);
+      }
+    }
+  }, [colorChoice, timeControl, learnOpening, coachOn, persona, botMove]);
 
-  // botMove captured at start needs latest persona — safe because persona
-  // doesn't change mid-game (picker only).
-  useEffect(
-    () => () => {
-      sessionRef.current++;
-    },
-    [],
-  );
-
+  /**
+   * Hints never reveal a move for the current position — that would be
+   * cheating. Level 1 is a concept, level 2 points at a piece. That's it.
+   */
   const requestHint = useCallback(async () => {
     const g = gameRef.current;
     if (phase !== 'playing' || g.turn() !== playerColor || !coachEngine.current) return;
-    const level = Math.min((hint?.level ?? 0) + 1, 3);
+    const ply = g.history().length;
+    if (hintRef.current.ply !== ply) hintRef.current = { ply, level: 0 };
+    if (hintRef.current.level >= 2) {
+      pushChat({ text: '💡 That’s all the help I’ll give for this move — the rest is yours.' });
+      return;
+    }
+    const level = ++hintRef.current.level;
     try {
       const analysis = await coachEngine.current.analyze(g.fen(), 11, 1);
       const bestUci = analysis.bestUci;
@@ -300,27 +515,21 @@ export function GamePage() {
         promotion: bestUci.length > 4 ? bestUci[4] : undefined,
       });
       let text: string;
-      let arrow: Arrow | null = null;
       if (level === 1) {
-        const top = analysis.lines[0];
-        if (top?.mate != null && top.mate > 0) {
-          text = 'You have a forced mate — examine every check.';
-        } else if (best.captured) text = 'There is a capture that works tactically. Count the exchanges.';
-        else if (best.san.includes('+')) text = 'Consider your checks — one of them is strong.';
-        else if (endgame) text = endgame.narration;
-        else text = 'No tactics here — find your least active piece and improve it.';
-      } else if (level === 2) {
-        text = `Look closer at your ${PIECE_NAME[best.piece]} on ${best.from}.`;
+        const eg = endgameRef.current;
+        if (eg && eg.strongSide === playerColor) text = `💡 ${eg.narration}`;
+        else if (best.captured) text = '💡 There’s a tactical capture available — count attackers and defenders on the contested squares.';
+        else if (best.san.includes('+')) text = '💡 Your checks deserve a look here.';
+        else text = '💡 Nothing forcing — improve your least active piece, and re-check what your opponent’s last move attacks.';
       } else {
-        text = `The move is ${best.san}.`;
-        arrow = { from: best.from, to: best.to, color: 'rgba(129,182,76,0.9)' };
-        setStats((s) => ({ ...s, moveHintsUsed: s.moveHintsUsed + 1 }));
+        text = `💡 Think about your ${PIECE_NAME[best.piece]} on ${best.from}. Where does it want to be?`;
       }
-      setHint({ level, text, arrow });
+      setStats((s) => ({ ...s, hintsUsed: s.hintsUsed + 1 }));
+      pushChat({ text });
     } catch (e) {
       console.error('hint failed', e);
     }
-  }, [phase, playerColor, hint, endgame]);
+  }, [phase, playerColor, pushChat]);
 
   const resign = useCallback(() => {
     if (phase !== 'playing') return;
@@ -329,6 +538,10 @@ export function GamePage() {
     setResult(`You resigned — ${persona.name} wins`);
     setPhase('over');
   }, [phase, persona]);
+
+  const reveal = useCallback((id: number) => {
+    setChat((c) => c.map((m) => (m.id === id ? { ...m, revealed: true } : m)));
+  }, []);
 
   /* ---------------- Render ---------------- */
 
@@ -356,14 +569,26 @@ export function GamePage() {
         </div>
         <div className="options-row">
           <label>
+            Time
+            <span className="seg">
+              {(
+                [
+                  ['blitz', 'Blitz · 5 min'],
+                  ['normal', 'Normal · 10 min'],
+                  ['unlimited', 'Unlimited'],
+                ] as const
+              ).map(([tc, label]) => (
+                <button key={tc} className={timeControl === tc ? 'on' : ''} onClick={() => setTimeControl(tc)}>
+                  {label}
+                </button>
+              ))}
+            </span>
+          </label>
+          <label>
             Play as
             <span className="seg">
               {(['w', 'random', 'b'] as const).map((c) => (
-                <button
-                  key={c}
-                  className={colorChoice === c ? 'on' : ''}
-                  onClick={() => setColorChoice(c)}
-                >
+                <button key={c} className={colorChoice === c ? 'on' : ''} onClick={() => setColorChoice(c)}>
                   {c === 'w' ? 'White' : c === 'b' ? 'Black' : 'Random'}
                 </button>
               ))}
@@ -374,10 +599,39 @@ export function GamePage() {
             Coach my moves
           </label>
         </div>
+        <div className="sub" style={{ marginBottom: 8 }}>
+          Study an opening (optional) — the coach walks you through the line and the bot plays along:
+        </div>
+        <div className="opening-row">
+          <button
+            className={`opening-card${learnOpening === null ? ' selected' : ''}`}
+            onClick={() => setLearnOpening(null)}
+          >
+            <div className="name">Free play</div>
+            <div className="tag">no study line</div>
+          </button>
+          {POPULAR_OPENINGS.map((name) => (
+            <button
+              key={name}
+              className={`opening-card${learnOpening === name ? ' selected' : ''}`}
+              onClick={() => {
+                setLearnOpening(name);
+                setColorChoice(OPENING_PICK_INFO[name].color);
+              }}
+            >
+              <div className="name">{name}</div>
+              <div className="tag">{OPENING_PICK_INFO[name].tag}</div>
+            </button>
+          ))}
+        </div>
         <button className="btn primary big" onClick={() => void startGame()} disabled={phase === 'loading'}>
           {phase === 'loading' ? 'Loading engine…' : 'Play'}
         </button>
-        {engineError && <div className="muted" style={{ marginTop: 12 }}>Engine failed to load: {engineError}</div>}
+        {engineError && (
+          <div className="muted" style={{ marginTop: 12 }}>
+            Engine failed to load: {engineError}
+          </div>
+        )}
       </div>
     );
   }
@@ -386,7 +640,8 @@ export function GamePage() {
     stats.accuracies.length > 0
       ? stats.accuracies.reduce((a, b) => a + b, 0) / stats.accuracies.length
       : null;
-  const arrows: Arrow[] = hint?.arrow ? [hint.arrow] : [];
+  const showClocks = timeControl !== 'unlimited';
+  const botColor = playerColor === 'w' ? 'b' : 'w';
 
   return (
     <>
@@ -396,48 +651,67 @@ export function GamePage() {
           rating={persona.elo}
           avatar={persona.avatar}
           history={history}
-          color={playerColor === 'w' ? 'b' : 'w'}
+          color={botColor}
           thinking={thinking}
+          clockMs={showClocks ? clocks[botColor] : null}
+          clockActive={phase === 'playing' && gameRef.current.turn() === botColor}
         />
         <BoardView
           fen={fen}
           orientation={playerColor === 'w' ? 'white' : 'black'}
           onDrop={onDrop}
           lastMove={lastMove}
-          arrows={arrows}
           draggable={phase === 'playing'}
         />
-        <PlayerBar name="You" rating={null} avatar="🙂" history={history} color={playerColor} />
+        <PlayerBar
+          name="You"
+          rating={null}
+          avatar="🙂"
+          history={history}
+          color={playerColor}
+          clockMs={showClocks ? clocks[playerColor] : null}
+          clockActive={phase === 'playing' && gameRef.current.turn() === playerColor}
+        />
       </div>
 
       <div className="panel">
-        <div className="tabs">
-          <button className={`tab${tab === 'moves' ? ' active' : ''}`} onClick={() => setTab('moves')}>
-            Moves
-          </button>
-          <button className={`tab${tab === 'coach' ? ' active' : ''}`} onClick={() => setTab('coach')}>
-            Coach{coachBusy && <span className="dot" />}
-          </button>
-          <button className={`tab${tab === 'opening' ? ' active' : ''}`} onClick={() => setTab('opening')}>
-            Opening{opening && opening.candidates.length > 0 && <span className="dot" />}
-          </button>
-          <button className={`tab${tab === 'endgame' ? ' active' : ''}`} onClick={() => setTab('endgame')}>
-            Endgame{endgame && <span className="dot" />}
-          </button>
+        <div className="panel-head">
+          vs {persona.name} ({persona.elo})
+          {learnOpening && <span className="panel-tag">📖 {learnOpening}</span>}
         </div>
-        <div className="panel-body">
-          {tab === 'moves' && <MoveList moves={rows} />}
-          {tab === 'coach' && (
-            <CoachTab report={report} coachOn={coachOn} busy={coachBusy} onReveal={() =>
-              setReport((r) => (r ? { ...r, showBetter: true } : r))
-            } />
-          )}
-          {tab === 'opening' && <OpeningTab status={opening} />}
-          {tab === 'endgame' && <EndgameTab state={endgame} />}
+        <div className="moves-scroll">
+          <MoveList moves={rows} />
+        </div>
+        <div className="chat" ref={chatBoxRef}>
+          {chat.map((m) => (
+            <div className="bubble" key={m.id}>
+              {m.verdict && (
+                <div className="coach-verdict" style={{ color: VERDICT_STYLE[m.verdict].color }}>
+                  <VerdictBadge verdict={m.verdict} />
+                  {m.san}: {VERDICT_STYLE[m.verdict].word}
+                </div>
+              )}
+              <div style={{ whiteSpace: 'pre-line' }}>{m.text}</div>
+              {m.better != null &&
+                (m.revealed ? (
+                  <div className="coach-better">
+                    Better was <b>{m.better}</b>
+                  </div>
+                ) : (
+                  <button className="btn small" onClick={() => reveal(m.id)}>
+                    Show what was better
+                  </button>
+                ))}
+            </div>
+          ))}
         </div>
         <div className="panel-actions">
-          <button className="btn" onClick={() => void requestHint()} disabled={phase !== 'playing' || gameRef.current.turn() !== playerColor}>
-            {hint ? `Hint (${Math.min(hint.level + 1, 3)}/3)` : 'Hint'}
+          <button
+            className="btn"
+            onClick={() => void requestHint()}
+            disabled={phase !== 'playing' || gameRef.current.turn() !== playerColor}
+          >
+            Hint
           </button>
           <button className="btn" onClick={resign} disabled={phase !== 'playing'}>
             Resign
@@ -446,18 +720,15 @@ export function GamePage() {
             New Game
           </button>
         </div>
-        {hint && phase === 'playing' && (
-          <div className="coach-note" style={{ margin: '0 14px 14px' }}>
-            💡 {hint.text}
-          </div>
-        )}
       </div>
 
       {phase === 'over' && result && (
         <div className="modal-backdrop">
           <div className="modal">
             <h2>{result}</h2>
-            <div className="sub">vs {persona.name} ({persona.elo})</div>
+            <div className="sub">
+              vs {persona.name} ({persona.elo})
+            </div>
             {avgAccuracy != null && (
               <div style={{ textAlign: 'left', marginBottom: 14 }}>
                 <div className="stat-row">
@@ -466,14 +737,14 @@ export function GamePage() {
                 </div>
                 {Object.entries(stats.counts).map(([v, n]) => (
                   <div className="stat-row" key={v}>
-                    <span style={{ textTransform: 'capitalize' }}>{VERDICT_STYLE[v as keyof typeof VERDICT_STYLE]?.word ?? v}</span>
+                    <span>{VERDICT_STYLE[v as keyof typeof VERDICT_STYLE]?.word ?? v}</span>
                     <b>{n}</b>
                   </div>
                 ))}
-                {stats.moveHintsUsed > 0 && (
+                {stats.hintsUsed > 0 && (
                   <div className="stat-row">
-                    <span>Move hints used</span>
-                    <b>{stats.moveHintsUsed}</b>
+                    <span>Hints used</span>
+                    <b>{stats.hintsUsed}</b>
                   </div>
                 )}
               </div>
@@ -485,118 +756,5 @@ export function GamePage() {
         </div>
       )}
     </>
-  );
-}
-
-function CoachTab({
-  report,
-  coachOn,
-  busy,
-  onReveal,
-}: {
-  report: CoachReport | null;
-  coachOn: boolean;
-  busy: boolean;
-  onReveal: () => void;
-}) {
-  if (!coachOn) {
-    return <div className="muted">The coach is off for this game. It reviews your moves after you make them — it never plays for you.</div>;
-  }
-  if (!report) {
-    return (
-      <div className="muted">
-        {busy ? 'Analyzing your move…' : 'After each of your moves, feedback appears here. The coach teaches — it won’t hand you moves unless you ask for an escalating hint.'}
-      </div>
-    );
-  }
-  return (
-    <div>
-      <div className="coach-verdict" style={{ color: VERDICT_STYLE[report.judgment.verdict].color }}>
-        <VerdictBadge verdict={report.judgment.verdict} />
-        {report.san}: {VERDICT_STYLE[report.judgment.verdict].word}
-      </div>
-      {report.notes.map((n, i) => (
-        <div className="coach-note" key={i}>
-          {n}
-        </div>
-      ))}
-      {report.betterMove &&
-        (report.showBetter ? (
-          <div className="coach-better">
-            Better was <b>{report.betterMove}</b>
-          </div>
-        ) : (
-          <button className="btn" onClick={onReveal}>
-            Show the better move
-          </button>
-        ))}
-      {busy && <div className="muted" style={{ marginTop: 8 }}>Analyzing…</div>}
-    </div>
-  );
-}
-
-function OpeningTab({ status }: { status: OpeningStatus | null }) {
-  if (!status || status.candidates.length === 0) {
-    return <div className="muted">Play recognizable opening moves (try 1.d4 and 2.Bf4 — the London System) and the opening teacher will follow along.</div>;
-  }
-  return (
-    <div>
-      <div className="coach-verdict" style={{ color: 'var(--text)' }}>
-        {status.name ?? 'Book position'}
-      </div>
-      {!status.name && status.inBook && (
-        <div className="coach-note">
-          Still in book — this could become: {status.candidates.join(', ')}.
-        </div>
-      )}
-      {status.inBook ? (
-        <>
-          <div className="coach-note">✅ You’re following main-line theory ({Math.ceil(status.matchedPlies / 2)} moves deep).</div>
-          {status.lastIdea && <div className="coach-note">{status.lastIdea}</div>}
-        </>
-      ) : (
-        <>
-          <div className="coach-note">
-            Play left theory after {Math.ceil(status.matchedPlies / 2)} book moves — that’s not
-            necessarily bad, just no longer “book.”
-          </div>
-          {status.deviation && (
-            <div className="coach-note">
-              Theory continues with <b>{status.deviation.expectedSan}</b>
-              {status.deviation.idea ? ` — ${status.deviation.idea}` : '.'}
-            </div>
-          )}
-        </>
-      )}
-    </div>
-  );
-}
-
-function EndgameTab({ state }: { state: EndgameState | null }) {
-  if (!state) {
-    return <div className="muted">When the game reaches a basic mating endgame (K+Q, K+R, or two rooks vs. king), technique guidance appears here.</div>;
-  }
-  return (
-    <div>
-      <div className="coach-verdict" style={{ color: 'var(--text)' }}>{state.title}</div>
-      <div className="coach-note">📍 {state.narration}</div>
-      {state.stalemateWarning && (
-        <div className="coach-note" style={{ border: '1px solid var(--blunder)' }}>
-          ⚠️ Stalemate danger: the defending king is running out of squares. Before you move, make
-          sure it still has one — or that you’re giving check.
-        </div>
-      )}
-      {state.fiftyMoveClock >= 60 && (
-        <div className="coach-note" style={{ border: '1px solid var(--inaccuracy)' }}>
-          ⏳ {100 - state.fiftyMoveClock} half-moves left before the 50-move rule draws this. Make
-          progress: shrink the box or push the king.
-        </div>
-      )}
-      <ol style={{ paddingLeft: 20, lineHeight: 1.6, fontSize: 14 }}>
-        {state.technique.map((s, i) => (
-          <li key={i}>{s}</li>
-        ))}
-      </ol>
-    </div>
   );
 }

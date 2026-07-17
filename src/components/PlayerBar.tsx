@@ -11,9 +11,19 @@ interface Props {
   history: Move[];
   color: 'w' | 'b';
   thinking?: boolean;
+  /** Remaining clock in ms, or null when untimed. */
+  clockMs?: number | null;
+  clockActive?: boolean;
 }
 
-export function PlayerBar({ name, rating, avatar, history, color, thinking }: Props) {
+function formatClock(ms: number): string {
+  const total = Math.max(0, Math.ceil(ms / 1000));
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${m}:${s.toString().padStart(2, '0')}`;
+}
+
+export function PlayerBar({ name, rating, avatar, history, color, thinking, clockMs, clockActive }: Props) {
   const mine = history.filter((m) => m.color === color && m.captured);
   const theirs = history.filter((m) => m.color !== color && m.captured);
   const captured = mine
@@ -33,6 +43,14 @@ export function PlayerBar({ name, rating, avatar, history, color, thinking }: Pr
       <div className="captures">{captured.map((p) => CAPTURE_GLYPH[p]).join('')}</div>
       {diff > 0 && <div className="mat">+{diff}</div>}
       {thinking && <div className="thinking">thinking…</div>}
+      {clockMs != null && (
+        <div
+          className={`clock${clockActive ? ' active' : ''}${clockMs < 30_000 ? ' low' : ''}`}
+          style={thinking ? undefined : { marginLeft: 'auto' }}
+        >
+          {formatClock(clockMs)}
+        </div>
+      )}
     </div>
   );
 }
