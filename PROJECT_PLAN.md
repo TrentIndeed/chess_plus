@@ -13,6 +13,9 @@ A chess.com-style app focused on **playing bots** (no human matchmaking) with tw
 - Play full games against bots at a chosen strength (roughly 400–2500 Elo).
 - Bots feel human: they follow plans, punish mistakes proportionally to their level, and their errors are *graded* (inaccuracies and mistakes, not just perfect-or-blunder).
 - After each of your moves, get instant feedback: move classification (best / good / inaccuracy / mistake / blunder), what the better idea was, and *why* in plain language — with emphasis on midgame concepts (piece activity, pawn structure, king safety, plans).
+- Learn classic openings (London System, Italian, Queen's Gambit, etc.): the coach recognizes what you're playing, explains the ideas behind book moves, and points out when and why you've left theory.
+- Endgame checkmate guidance: when you reach a won endgame (K+Q vs K, K+R vs K, two-rook ladder), the coach teaches the *technique* — concepts like "shrink the box" and "bring your king up" — instead of feeding you moves.
+- **The coach is a guide, not a cheat engine** (see §4a): it teaches concepts and reviews your decisions; it never simply hands you the best move during play.
 - Checkmate puzzle mode (mate in 1/2/3), sourced from the free Lichess puzzle database, with progress tracking.
 - Runs entirely in the browser for the MVP (no server costs, no accounts needed to start).
 
@@ -20,7 +23,8 @@ A chess.com-style app focused on **playing bots** (no human matchmaking) with tw
 - Human vs. human play, matchmaking, chat.
 - Real rated Elo / anti-cheat.
 - Mobile native apps (responsive web first).
-- Opening courses, video lessons, or other chess.com premium content beyond the coach + puzzles.
+- Video lessons or other chess.com premium content beyond the coach, opening teacher, endgame guide, and puzzles.
+- Exhaustive opening theory — we teach ~10–15 classic systems well, not a full database.
 
 ---
 
@@ -83,6 +87,35 @@ Pipeline after every user move:
 5. **Post-game review:** accuracy score, eval graph, list of key moments, replayable with coach commentary.
 6. **Optional LLM mode:** feed the structured analysis (never the raw position alone) to Claude to produce friendlier, more specific prose. Strictly optional and keyed by the user — the rule-based engine is the default.
 
+### 4a. Coaching philosophy: a guide, not a cheat engine
+
+The coach exists to make the player stronger, not to play for them. Hard rules that shape every teaching feature:
+
+- **Feedback is retrospective by default.** The coach reacts to moves you already made. It never volunteers "play this move next" during a live game.
+- **Hints are conceptual and escalate only on request.** If the player explicitly asks for help, hints go concept → piece → line: first a principle ("your king is doing nothing — endgames are won with active kings"), then a nudge ("look at your rook"), and only at the last level a concrete line — and using a line-level hint is recorded in the post-game summary so progress tracking stays honest.
+- **No engine crutches during play.** No eval bar, no best-move arrows, no "engine says" readouts while a game is in progress. Those live in the post-game review only.
+- **Technique over answers in endgames.** The endgame guide (§4c) teaches repeatable methods (the box method, ladder mate, opposition) rather than solving the position for you.
+- Since all opponents are bots, there's no fair-play issue with other humans — this stance is purely about learning: a coach that hands out moves teaches dependence, not chess.
+
+### 4b. Opening teacher (classic openings)
+
+Goal: learn real openings — London System, Italian Game, Ruy Lopez, Queen's Gambit, Caro-Kann, Sicilian basics — by playing them, not memorizing them.
+
+- **Opening book data:** build a curated book (ECO codes + move trees + per-move idea annotations) for ~10–15 classic openings. Sources: public-domain ECO classifications plus our own written annotations; Lichess opening explorer data (free API/dumps) for popularity stats. Stored as static JSON, same pattern as puzzles.
+- **Recognition & narration:** during the opening phase the coach names what's on the board ("This is the London System — the point of 3.Bf4 is to develop the bishop *before* locking it in with e3") and explains the idea behind each book move as it's played, by either side.
+- **Deviation feedback:** when the player leaves the book, the coach doesn't just say "theory says d4" — it explains what the book move accomplishes and what the played move gives up, using the same rule-based detectors as the midgame coach. Reasonable non-book moves are acknowledged as playable, not marked wrong.
+- **Guided practice mode:** pick an opening to study; the bot plays the main-line responses (with rating-appropriate variety from sidelines) so the player can drill the system against live resistance. A "learn" sub-mode walks through the main line once with annotations before free play.
+- **Repertoire tracking:** per-opening familiarity stats (how deep the player stays in book, common deviation points) feed a simple "your repertoire" page.
+
+### 4c. Endgame checkmate guide
+
+Goal: stop the classic beginner failure — being up a queen and shuffling into stalemate or the 50-move rule.
+
+- **Detection:** when the game reaches a known won-mate configuration (K+Q vs K, K+R vs K, K+2R vs K; later K+2B vs K and K+B+N vs K), the coach switches into endgame-guide mode.
+- **Technique teaching:** each mate type has a small scripted lesson built on its standard method — the box/shrinking-fence method for K+Q and K+R, the ladder for two rooks, opposition and king activity throughout. The coach narrates the *phase* the player is in ("the box is small enough — now bring your king to help") rather than dictating squares.
+- **Guardrails, not answers:** consistent with §4a, the guide warns about the two real dangers — stalemate patterns and the 50-move counter — when the player is about to walk into them ("careful: does your opponent's king have any moves after this?" as a pre-move nudge only when a stalemating blunder is on the board and the player hovers/commits it — flagged as a "coach save" in the summary).
+- **Practice drills:** standalone drill mode seeded with randomized won positions of each type; success = mate within a move budget without stalemate. This complements the puzzle trainer (§5): puzzles teach *spotting* forced mates, drills teach *converting* won endgames.
+
 ---
 
 ## 5. Checkmate Puzzles
@@ -107,7 +140,10 @@ Pipeline after every user move:
 │  ├─ game/        chess.js wrapper, PGN, clocks              │
 │  ├─ bot/         humanizer: candidates → plan bias →        │
 │  │               temperature sampling → blunder check       │
-│  ├─ coach/       classification + explanation rules         │
+│  ├─ coach/       classification + explanation rules,        │
+│  │               hint escalation policy (§4a)               │
+│  ├─ openings/    book data, recognition, deviation feedback │
+│  ├─ endgame/     mate detection, technique lessons, drills  │
 │  └─ puzzles/     loader, validator, rating tracker          │
 │                                                             │
 │  Workers                                                    │
@@ -130,13 +166,15 @@ Key decision: **two engine instances** so coaching analysis never delays the bot
 
 **M2 — Humanizer v1 (the differentiator):** MultiPV candidates + temperature sampling + blunder-realism check + move pacing. 5–6 bot personas at distinct Elo targets. Calibration harness (bot-vs-bot matches, centipawn-loss comparison) as a script.
 
-**M3 — Coach v1:** second worker, move classification, top ~15 rule-based explanations (tactics + midgame concepts), coach sidebar with arrows, post-game accuracy summary.
+**M3 — Coach v1:** second worker, move classification, top ~15 rule-based explanations (tactics + midgame concepts), coach sidebar with arrows, post-game accuracy summary. Guide-not-cheat rules (§4a) enforced from the start: retrospective feedback, escalating hints, no live eval bar.
 
-**M4 — Puzzles:** preprocessing script, mate-in-1/2/3 trainer, local progress + puzzle rating.
+**M4 — Puzzles & endgame guide:** puzzle preprocessing script, mate-in-1/2/3 trainer, local progress + puzzle rating. Endgame checkmate guide v1 (§4c): K+Q, K+R, and two-rook mates with technique narration, stalemate/50-move guardrails, and conversion drills.
 
-**M5 — Depth & polish:** plan-persistence layer for bots (visible intent), more explanation rules, full game review page with eval graph, bot personalities (aggressive/positional/endgame-grinder via bias presets), settings.
+**M5 — Opening teacher:** curated book for ~10 classic openings (London first), recognition + idea narration during games, deviation feedback, guided practice mode against the bots, repertoire tracking page.
 
-**M6 — Stretch:** Maia integration, optional accounts/sync backend, optional LLM coach prose, opening-mistake coaching.
+**M6 — Depth & polish:** plan-persistence layer for bots (visible intent), more explanation rules, full game review page with eval graph, bot personalities (aggressive/positional/endgame-grinder via bias presets), settings.
+
+**M7 — Stretch:** Maia integration, remaining hard mates (K+2B, K+B+N), deeper opening book coverage, optional accounts/sync backend, optional LLM coach prose.
 
 Each milestone is shippable and demoable on its own.
 
@@ -151,7 +189,9 @@ Each milestone is shippable and demoable on its own.
 | Explanation engine says wrong/obvious things | Only surface an explanation when a detector fires with high confidence; fall back to showing the better line without prose |
 | Stockfish GPL vs. app licensing | Keep engine as a separately-loaded worker asset; make the repo GPL-compatible (simplest: license the whole project GPLv3) |
 | Puzzle DB size (~4M rows) | Offline preprocessing to small JSON chunks; ship only mate puzzles, lazy-load buckets |
-| Scope creep toward chess.com parity | Non-goals list above; bots + coach + puzzles only until M5 is done |
+| Opening annotations are hand-written (slow, needs chess knowledge) | Start with the London only (small, systemic, beginner-favorite), template the annotation format, add one opening at a time |
+| Coach drifts into move-feeding as features grow | §4a rules are acceptance criteria for every teaching feature; hint-usage tracking keeps it visible |
+| Scope creep toward chess.com parity | Non-goals list above; bots + coach + puzzles + opening/endgame guides only until M6 is done |
 
 ---
 
@@ -166,6 +206,8 @@ chess_plus/
 │  │  ├─ game/
 │  │  ├─ bot/            # humanizer lives here
 │  │  ├─ coach/
+│  │  ├─ openings/       # opening book + teacher
+│  │  ├─ endgame/        # mate technique guide + drills
 │  │  └─ puzzles/
 │  ├─ workers/
 │  └─ storage/
