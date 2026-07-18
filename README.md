@@ -1,5 +1,8 @@
 # Chess Plus
 
+![Chess Plus board with the built-in coach](docs/screenshot.png)
+*Playing a 600-Elo bot - the coach flags inaccuracies and missed mates move by move.*
+
 A chess.com-style app for playing **human-like bots** — with a built-in teacher.
 
 Unlike bots that play perfectly and then randomly blunder, Chess Plus bots pick
